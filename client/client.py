@@ -1,10 +1,6 @@
 """
 client.py — Client chat với mã hóa AES + RSA thực sự.
 
-Cách dùng:
-  python client.py alice
-  python client.py bob    (chạy terminal khác)
-
 Luồng hoạt động:
   1. Sinh cặp khóa RSA-2048 của chính mình.
   2. Gửi public key lên server.

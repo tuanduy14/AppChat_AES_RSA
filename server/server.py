@@ -8,7 +8,6 @@ Luồng hoạt động:
   4. Server relay gói tin đó sang Bob (không thể giải mã vì không có private key của Bob).
   5. Từ đó mọi tin nhắn chat đều là AES-encrypted, server chỉ relay mù.
 
-Chạy: python server.py
 """
 
 import socket

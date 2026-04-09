@@ -1,105 +1,64 @@
-"""
-client.py — Client chat với mã hóa AES + RSA + hỗ trợ bật/tắt MITM.
-
-bthg:
-  python client.py alice
-  python client.py bob
-
-bật MITM:
-  python client.py alice mitm
-  python client.py bob mitm
-"""
-
 import socket
 import threading
 import json
 import sys
 import os
-import base64
+import signal
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from shared.crypto_utils import (
     generate_rsa_keypair, serialize_public_key, deserialize_public_key,
     rsa_encrypt, rsa_decrypt,
     generate_aes_key, aes_encrypt, aes_decrypt,
-    bytes_to_b64, b64_to_bytes, pretty_hex,
+    bytes_to_b64, b64_to_bytes,
+    rsa_sign, rsa_verify
 )
 
 HOST = "127.0.0.1"
 
-# ===== MITM TOGGLE =====
 USE_ATTACKER = False
+USE_SIGNATURE = False
 
-# parse CLI
-if len(sys.argv) >= 3 and sys.argv[2].lower() == "mitm":
+if len(sys.argv) >= 3 and sys.argv[2] == "mitm":
     USE_ATTACKER = True
 
-# chọn PORT
-if USE_ATTACKER:
-    if len(sys.argv) >= 2 and sys.argv[1].lower() == "alice":
-        PORT = 5555   # attacker
-    else:
-        PORT = 65432  # server
+if len(sys.argv) >= 4 and sys.argv[3] == "secure":
+    USE_SIGNATURE = True
+
+if USE_ATTACKER and sys.argv[1] == "alice":
+    PORT = 5555
 else:
     PORT = 65432
 
-# ANSI colors
-RESET  = "\033[0m"
-BOLD   = "\033[1m"
-CYAN   = "\033[96m"
-GREEN  = "\033[92m"
-YELLOW = "\033[93m"
-RED    = "\033[91m"
-GRAY   = "\033[90m"
-MAGENTA= "\033[95m"
-
 
 class ChatClient:
-    def __init__(self, name: str):
+    def __init__(self, name):
         self.name = name
-        self.color = CYAN if name == "alice" else GREEN
+        self.running = True
 
-        print(f"\n{self.color}{BOLD}╔══════════════════════════════════════╗")
-        print(f"║   AES + RSA Chat — {name.upper():<18}║")
-        print(f"╚══════════════════════════════════════╝{RESET}\n")
+        print(f"\n=== {name.upper()} ===")
 
-        # Mode info
         if USE_ATTACKER:
-            self._log("SYS", "⚠️ MITM MODE: Alice đi qua attacker")
-        else:
-            self._log("SYS", "🛡️ SECURE MODE: Kết nối trực tiếp server")
+            print(" MITM MODE")
+        if USE_SIGNATURE:
+            print(" SIGNATURE ENABLED")
 
-        # RSA
-        self._log("RSA", "Đang sinh cặp khóa RSA-2048 ...")
-        self.private_key, self.public_key = generate_rsa_keypair(2048)
-        pub_pem = serialize_public_key(self.public_key)
+        self.private_key, self.public_key = generate_rsa_keypair()
+        self.pub_key_pem = serialize_public_key(self.public_key).decode()
 
-        self._log("RSA", f"✓ Sinh xong cặp khóa RSA-2048")
-        self._log("RSA", f"  Public key:\n{GRAY}{pub_pem.decode()[:200].strip()}{RESET}")
-        self._log("RSA", f"  Private key (GIỮ BÍ MẬT)")
-
-        self.pub_key_pem = pub_pem.decode()
         self.peer_pub_key = None
-        self.aes_key: bytes = None
+        self.aes_key = None
 
         self.conn = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 
-    def _log(self, tag: str, msg: str):
-        tags = {"RSA": YELLOW, "AES": GREEN, "SYS": CYAN, "ERR": RED}
-        c = tags.get(tag, "")
-        print(f"{c}[{tag}]{RESET} {msg}")
-
-    def _send(self, data: dict):
-        raw = json.dumps(data).encode("utf-8")
+    def send(self, data):
+        raw = json.dumps(data).encode()
         self.conn.sendall(len(raw).to_bytes(4, "big") + raw)
 
-    def _recv(self) -> dict:
-        raw_len = b""
-        while len(raw_len) < 4:
-            chunk = self.conn.recv(4 - len(raw_len))
-            if not chunk:
-                raise ConnectionError
-            raw_len += chunk
+    def recv(self):
+        raw_len = self.conn.recv(4)
+        if not raw_len:
+            raise ConnectionError
 
         length = int.from_bytes(raw_len, "big")
 
@@ -110,101 +69,141 @@ class ChatClient:
         return json.loads(raw.decode())
 
     def connect(self):
-        self._log("SYS", f"Kết nối tới {HOST}:{PORT} ...")
         self.conn.connect((HOST, PORT))
 
-        self._send({
+        self.send({
             "type": "hello",
             "name": self.name,
             "pub_key_pem": self.pub_key_pem,
         })
 
-        ack = self._recv()
-        self._log("SYS", f"Server: {ack['msg']}")
+        print(self.recv()["msg"])
 
-    def _do_handshake_as_alice(self):
-        self._log("SYS", "=== HANDSHAKE ALICE ===")
+    # ─── FIX: terminate() đúng thứ tự, chặn double-call, unblock input() ───
+    def terminate(self, reason):
+        if not self.running:
+            return  # tránh gọi terminate 2 lần
 
-        self.aes_key = generate_aes_key(32)
-        self._log("AES", f"AES key: {pretty_hex(self.aes_key)}")
+        self.running = False  # chặn chat_loop NGAY, trước mọi thứ khác
 
-        encrypted = rsa_encrypt(self.peer_pub_key, self.aes_key)
+        print(f"\n TERMINATED: {reason}")
 
-        self._send({
-            "type": "aes_key_exchange",
-            "encrypted_aes_key": bytes_to_b64(encrypted),
-        })
-
-        self._log("SYS", "✓ Đã gửi AES key")
-
-    def _do_handshake_as_bob(self, encrypted_key_b64):
-        self._log("SYS", "=== HANDSHAKE BOB ===")
-
-        encrypted = b64_to_bytes(encrypted_key_b64)
-        self.aes_key = rsa_decrypt(self.private_key, encrypted)
-
-        self._log("AES", f"AES key: {pretty_hex(self.aes_key)}")
-
-    def _recv_loop(self):
         try:
-            while True:
-                msg = self._recv()
+            self.send({
+                "type": "terminate",
+                "reason": reason
+            })
+        except Exception:
+            pass
 
-                if msg["type"] == "peer_pubkey":
-                    self.peer_pub_key = deserialize_public_key(msg["pub_key_pem"].encode())
+        try:
+            self.conn.shutdown(socket.SHUT_RDWR)
+        except Exception:
+            pass
+
+        try:
+            self.conn.close()
+        except Exception:
+            pass
+
+        # SIGINT để unblock input() đang blocking ở main thread
+        # sau đó os._exit(1) hard-kill toàn process
+        os.kill(os.getpid(), signal.SIGINT)
+        os._exit(1)
+
+    def recv_loop(self):
+        try:
+            while self.running:
+                msg = self.recv()
+
+                # nhận lệnh kill từ server
+                if msg["type"] == "terminate":
+                    print(f"\n SERVER STOP: {msg['reason']}")
+                    self.running = False
+                    os._exit(0)
+
+                elif msg["type"] == "peer_pubkey":
+                    self.peer_pub_key = deserialize_public_key(
+                        msg["pub_key_pem"].encode()
+                    )
 
                     if self.name == "alice":
-                        self._do_handshake_as_alice()
+                        self.aes_key = generate_aes_key()
+                        encrypted = rsa_encrypt(self.peer_pub_key, self.aes_key)
+
+                        self.send({
+                            "type": "aes_key_exchange",
+                            "encrypted_aes_key": bytes_to_b64(encrypted)
+                        })
 
                 elif msg["type"] == "aes_key_exchange":
                     if self.name == "bob":
-                        self._do_handshake_as_bob(msg["encrypted_aes_key"])
+                        encrypted = b64_to_bytes(msg["encrypted_aes_key"])
+                        self.aes_key = rsa_decrypt(self.private_key, encrypted)
 
                 elif msg["type"] == "chat":
                     if not self.aes_key:
                         continue
 
-                    plaintext = aes_decrypt(
-                        self.aes_key,
-                        msg["iv"],
-                        msg["ciphertext"]
-                    )
+                    # VERIFY SIGNATURE
+                    if USE_SIGNATURE:
+                        if "signature" not in msg:
+                            self.terminate("MITM DETECTED (NO SIGNATURE)")
+                            return  # ← đảm bảo không chạy tiếp sau terminate
 
-                    print(f"\n{msg['from'].upper()}: {plaintext}")
-                    print(f"{self.name.upper()}> ", end="", flush=True)
+                        payload = msg["iv"] + msg["ciphertext"]
+                        sig = b64_to_bytes(msg["signature"])
 
-        except:
-            self._log("SYS", "Mất kết nối")
+                        if not rsa_verify(self.peer_pub_key, sig, payload.encode()):
+                            self.terminate("MITM DETECTED (INVALID SIGNATURE)")
+                            return  # ← đảm bảo không chạy tiếp sau terminate
+
+                    text = aes_decrypt(self.aes_key, msg["iv"], msg["ciphertext"])
+                    print(f"\n{msg['from']}: {text}")
+
+        except Exception:
+            # Chỉ terminate nếu process vẫn đang chạy (tránh loop)
+            if self.running:
+                self.terminate("Connection lost")
 
     def chat_loop(self):
-        threading.Thread(target=self._recv_loop, daemon=True).start()
+        threading.Thread(target=self.recv_loop, daemon=True).start()
 
-        while True:
+        while self.running:
             try:
-                text = input(f"{self.name.upper()}> ")
+                text = input("> ")
+
+                # ← FIX: kiểm tra lại running sau khi input() unblock
+                if not self.running:
+                    break
 
                 if not self.aes_key:
-                    print("Chưa handshake xong")
+                    print("Wait handshake...")
                     continue
 
                 enc = aes_encrypt(self.aes_key, text)
 
-                self._send({
+                data = {
                     "type": "chat",
                     "iv": enc["iv"],
                     "ciphertext": enc["ciphertext"],
-                })
+                }
 
-            except:
+                if USE_SIGNATURE:
+                    payload = enc["iv"] + enc["ciphertext"]
+                    sig = rsa_sign(self.private_key, payload.encode())
+                    data["signature"] = bytes_to_b64(sig)
+
+                self.send(data)
+
+            except (KeyboardInterrupt, EOFError):
+                break
+            except Exception:
                 break
 
 
 def main():
-    if len(sys.argv) < 2:
-        print("Dùng: python client.py alice|bob [mitm]")
-        return
-
-    name = sys.argv[1].lower()
+    name = sys.argv[1]
     client = ChatClient(name)
     client.connect()
     client.chat_loop()

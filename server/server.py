@@ -79,6 +79,21 @@ def broadcast_peer_key(sender_name: str):
                     log("ERR", f"Không gửi được public key tới {name}: {e}")
 
 
+def notify_peer_terminate(sender_name: str, reason: str):
+    """Forward lệnh terminate sang peer để peer cũng dừng."""
+    with lock:
+        for pname, pinfo in clients.items():
+            if pname != sender_name:
+                try:
+                    send_json(pinfo["conn"], {
+                        "type": "terminate",
+                        "reason": reason,
+                    })
+                    log("SYS", f"Forward terminate → {pname}: {reason}")
+                except Exception as e:
+                    log("ERR", f"Không forward terminate được tới {pname}: {e}")
+
+
 def handle_client(conn: socket.socket, addr):
     name = None
     try:
@@ -144,17 +159,28 @@ def handle_client(conn: socket.socket, addr):
                 log("AES", f"  Ciphertext: {pretty_hex(cipher_bytes)}")
                 log("AES", f"  Server KHÔNG thể đọc nội dung (không có AES key)")
 
-                # Relay sang peer
+                # FIX: Relay sang peer — giữ nguyên signature nếu có
+                relay_msg = {
+                    "type": "chat",
+                    "from": name,
+                    "iv": iv,
+                    "ciphertext": ciphertext,
+                }
+                if "signature" in msg:
+                    relay_msg["signature"] = msg["signature"]
+
                 with lock:
                     for pname, pinfo in clients.items():
                         if pname != name:
-                            send_json(pinfo["conn"], {
-                                "type": "chat",
-                                "from": name,
-                                "iv": iv,
-                                "ciphertext": ciphertext,
-                            })
+                            send_json(pinfo["conn"], relay_msg)
                             log("AES", f"  Relay AES cipher → {pname}")
+
+            # FIX: forward terminate sang peer để peer cũng dừng
+            elif msg["type"] == "terminate":
+                reason = msg.get("reason", "peer terminated")
+                log("SYS", f"{name} gửi terminate: {reason}")
+                notify_peer_terminate(name, reason)
+                break
 
             elif msg["type"] == "bye":
                 log("SYS", f"{name} ngắt kết nối")

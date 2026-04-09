@@ -32,7 +32,7 @@ MAGENTA= "\033[95m"
 class MITMAttacker:
     def __init__(self):
         print(f"\n{RED}{BOLD}╔══════════════════════════════════════╗")
-        print(f"║        ⚠️  MITM ATTACKER ACTIVE      ║")
+        print(f"║          MITM ATTACKER ACTIVE      ║")
         print(f"╚══════════════════════════════════════╝{RESET}\n")
 
         # RSA attacker
@@ -48,6 +48,7 @@ class MITMAttacker:
         self.server_conn = None
 
         self.real_bob_pub = None
+        self.running = True
 
     def _log(self, tag, msg):
         colors = {"RSA": YELLOW, "AES": GREEN, "SYS": CYAN, "ERR": RED, "HACK": MAGENTA}
@@ -68,6 +69,24 @@ class MITMAttacker:
             raw += conn.recv(4096)
 
         return json.loads(raw.decode())
+
+    def _shutdown(self, reason):
+        """Dừng attacker, đóng cả 2 connection."""
+        if not self.running:
+            return
+        self.running = False
+        self._log("SYS", f"Attacker shutdown: {reason}")
+        try:
+            self.alice_conn.shutdown(socket.SHUT_RDWR)
+            self.alice_conn.close()
+        except:
+            pass
+        try:
+            self.server_conn.shutdown(socket.SHUT_RDWR)
+            self.server_conn.close()
+        except:
+            pass
+        os._exit(0)
 
     # =========================
 
@@ -90,14 +109,15 @@ class MITMAttacker:
         threading.Thread(target=self.handle_alice, daemon=True).start()
         threading.Thread(target=self.handle_server, daemon=True).start()
 
-        while True:
+        while self.running:
             pass
 
     # =========================
 
     def handle_alice(self):
+        """Nhận message từ Alice, intercept rồi forward lên server."""
         try:
-            while True:
+            while self.running:
                 msg = self._recv(self.alice_conn)
 
                 # HELLO
@@ -117,7 +137,7 @@ class MITMAttacker:
 
                     self.aes_key = rsa_decrypt(self.priv, encrypted)
 
-                    self._log("HACK", "🔥 Lấy được AES key:")
+                    self._log("HACK", " Lấy được AES key:")
                     self._log("AES", pretty_hex(self.aes_key))
 
                     if not self.real_bob_pub:
@@ -132,7 +152,8 @@ class MITMAttacker:
                         "encrypted_aes_key": bytes_to_b64(encrypted2)
                     })
 
-                # CHAT
+                # CHAT — intercept nhưng KHÔNG forward signature
+                # (đây chính là điểm bị phát hiện khi secure mode)
                 elif msg["type"] == "chat":
                     if not self.aes_key:
                         self._log("ERR", "Chưa có AES key")
@@ -144,24 +165,40 @@ class MITMAttacker:
                         msg["ciphertext"]
                     )
 
-                    self._log("HACK", f"🔥 Alice → Bob: {plaintext}")
+                    self._log("HACK", f" Alice → Bob: {plaintext}")
 
                     enc = aes_encrypt(self.aes_key, plaintext)
 
+                    # FIX: KHÔNG forward signature (attacker không có private key Alice
+                    # nên không thể tạo signature hợp lệ) → Bob sẽ detect MITM
                     self._send(self.server_conn, {
                         "type": "chat",
                         "iv": enc["iv"],
                         "ciphertext": enc["ciphertext"]
+                        # signature bị drop có chủ ý → Bob detect MITM
                     })
 
+                # FIX: forward terminate lên server → server forward sang Bob → Bob dừng
+                elif msg["type"] == "terminate":
+                    reason = msg.get("reason", "peer terminated")
+                    self._log("SYS", f"Alice terminate: {reason} → forward lên server")
+                    self._send(self.server_conn, {
+                        "type": "terminate",
+                        "reason": reason
+                    })
+                    self._shutdown(f"Alice detected MITM: {reason}")
+
         except Exception as e:
-            self._log("ERR", f"Alice lỗi: {e}")
+            if self.running:
+                self._log("ERR", f"Alice lỗi: {e}")
+                self._shutdown("Alice connection lost")
 
     # =========================
 
     def handle_server(self):
+        """Nhận message từ server (thực ra là từ Bob), forward xuống Alice."""
         try:
-            while True:
+            while self.running:
                 msg = self._recv(self.server_conn)
 
                 # PUBLIC KEY BOB
@@ -191,7 +228,7 @@ class MITMAttacker:
                         msg["ciphertext"]
                     )
 
-                    self._log("HACK", f"🔥 Bob → Alice: {plaintext}")
+                    self._log("HACK", f" Bob → Alice: {plaintext}")
 
                     enc = aes_encrypt(self.aes_key, plaintext)
 
@@ -200,14 +237,27 @@ class MITMAttacker:
                         "from": "bob",
                         "iv": enc["iv"],
                         "ciphertext": enc["ciphertext"]
+                        # signature bị drop có chủ ý
                     })
 
+                # FIX: forward terminate từ server/Bob xuống Alice
+                elif msg["type"] == "terminate":
+                    reason = msg.get("reason", "peer terminated")
+                    self._log("SYS", f"Server terminate: {reason} → forward xuống Alice")
+                    self._send(self.alice_conn, {
+                        "type": "terminate",
+                        "reason": reason
+                    })
+                    self._shutdown(f"Server terminated: {reason}")
+
                 else:
-                    # forward ACK, bye, ...
+                    # forward ACK, peer_offline, ...
                     self._send(self.alice_conn, msg)
 
         except Exception as e:
-            self._log("ERR", f"Server lỗi: {e}")
+            if self.running:
+                self._log("ERR", f"Server lỗi: {e}")
+                self._shutdown("Server connection lost")
 
 
 # =========================

@@ -25,6 +25,10 @@ if len(sys.argv) >= 3 and sys.argv[2] == "mitm":
 if len(sys.argv) >= 4 and sys.argv[3] == "secure":
     USE_SIGNATURE = True
 
+# Khi chạy MITM, tự động bật chữ ký để phát hiện sửa đổi nội dung
+if USE_ATTACKER:
+    USE_SIGNATURE = True
+
 if USE_ATTACKER and sys.argv[1] == "alice":
     PORT = 5555
 else:
@@ -145,21 +149,27 @@ class ChatClient:
                     if not self.aes_key:
                         continue
 
+                    integrity_violation = False
+
                     # VERIFY SIGNATURE
                     if USE_SIGNATURE:
                         if "signature" not in msg:
-                            self.terminate("MITM DETECTED (NO SIGNATURE)")
-                            return  # ← đảm bảo không chạy tiếp sau terminate
+                            # Signature missing indicates content modification
+                            print("\n[ALERT] INTEGRITY VIOLATION: Message content has been modified.")
+                            integrity_violation = True
+                        else:
+                            payload = msg["iv"] + msg["ciphertext"]
+                            sig = b64_to_bytes(msg["signature"])
 
-                        payload = msg["iv"] + msg["ciphertext"]
-                        sig = b64_to_bytes(msg["signature"])
-
-                        if not rsa_verify(self.peer_pub_key, sig, payload.encode()):
-                            self.terminate("MITM DETECTED (INVALID SIGNATURE)")
-                            return  # ← đảm bảo không chạy tiếp sau terminate
+                            if not rsa_verify(self.peer_pub_key, sig, payload.encode()):
+                                print("\n[ALERT] INTEGRITY VIOLATION: Message content has been modified.")
+                                integrity_violation = True
 
                     text = aes_decrypt(self.aes_key, msg["iv"], msg["ciphertext"])
-                    print(f"\n{msg['from']}: {text}")
+                    if integrity_violation:
+                        print(f"\n{msg['from']}: {text} [POTENTIALLY MODIFIED]")
+                    else:
+                        print(f"\n{msg['from']}: {text}")
 
         except Exception:
             # Chỉ terminate nếu process vẫn đang chạy (tránh loop)

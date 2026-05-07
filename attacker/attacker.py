@@ -10,6 +10,7 @@ from shared.crypto_utils import (
     rsa_encrypt, rsa_decrypt,
     aes_encrypt, aes_decrypt,
     bytes_to_b64, b64_to_bytes, pretty_hex,
+    rsa_sign,
 )
 
 # ===== CONFIG =====
@@ -49,6 +50,7 @@ class MITMAttacker:
 
         self.real_bob_pub = None
         self.running = True
+        self.prompt_lock = threading.Lock()
 
     def _log(self, tag, msg):
         colors = {"RSA": YELLOW, "AES": GREEN, "SYS": CYAN, "ERR": RED, "HACK": MAGENTA}
@@ -87,6 +89,21 @@ class MITMAttacker:
         except:
             pass
         os._exit(0)
+
+    def _modify_plaintext(self, plaintext, direction):
+        """Cho attacker sửa nội dung plaintext trước khi forward."""
+        with self.prompt_lock:
+            self._log("HACK", f"Intercepted [{direction}] plaintext: {plaintext}")
+            try:
+                new_text = input("Nhập nội dung mới:")
+            except (EOFError, KeyboardInterrupt):
+                return plaintext
+
+        if new_text.strip() in ["/skip", ""]:
+            return plaintext
+        if new_text.strip() == "/drop":
+            return None
+        return new_text
 
     # =========================
 
@@ -165,18 +182,26 @@ class MITMAttacker:
                         msg["ciphertext"]
                     )
 
-                    self._log("HACK", f" Alice → Bob: {plaintext}")
+                    modified = self._modify_plaintext(plaintext, "Alice → Bob")
+                    if modified is None:
+                        self._log("HACK", "Tin nhắn Alice bị drop")
+                        continue
 
-                    enc = aes_encrypt(self.aes_key, plaintext)
+                    enc = aes_encrypt(self.aes_key, modified)
 
-                    # FIX: KHÔNG forward signature (attacker không có private key Alice
-                    # nên không thể tạo signature hợp lệ) → Bob sẽ detect MITM
-                    self._send(self.server_conn, {
+                    forward_msg = {
                         "type": "chat",
                         "iv": enc["iv"],
-                        "ciphertext": enc["ciphertext"]
-                        # signature bị drop có chủ ý → Bob detect MITM
-                    })
+                        "ciphertext": enc["ciphertext"],
+                    }
+
+                    # Nếu nội dung không thay đổi, tạo signature hợp lệ với private key của attacker
+                    if modified == plaintext:
+                        payload = enc["iv"] + enc["ciphertext"]
+                        sig = rsa_sign(self.priv, payload.encode())
+                        forward_msg["signature"] = bytes_to_b64(sig)
+
+                    self._send(self.server_conn, forward_msg)
 
                 # FIX: forward terminate lên server → server forward sang Bob → Bob dừng
                 elif msg["type"] == "terminate":
@@ -228,17 +253,26 @@ class MITMAttacker:
                         msg["ciphertext"]
                     )
 
-                    self._log("HACK", f" Bob → Alice: {plaintext}")
+                    modified = self._modify_plaintext(plaintext, "Bob → Alice")
+                    if modified is None:
+                        self._log("HACK", "Tin nhắn Bob bị drop")
+                        continue
 
-                    enc = aes_encrypt(self.aes_key, plaintext)
-
-                    self._send(self.alice_conn, {
+                    enc = aes_encrypt(self.aes_key, modified)
+                    forward_msg = {
                         "type": "chat",
                         "from": "bob",
                         "iv": enc["iv"],
-                        "ciphertext": enc["ciphertext"]
-                        # signature bị drop có chủ ý
-                    })
+                        "ciphertext": enc["ciphertext"],
+                    }
+
+                    # Nếu nội dung không thay đổi, tạo signature hợp lệ với private key của attacker
+                    if modified == plaintext:
+                        payload = enc["iv"] + enc["ciphertext"]
+                        sig = rsa_sign(self.priv, payload.encode())
+                        forward_msg["signature"] = bytes_to_b64(sig)
+
+                    self._send(self.alice_conn, forward_msg)
 
                 # FIX: forward terminate từ server/Bob xuống Alice
                 elif msg["type"] == "terminate":
@@ -248,7 +282,6 @@ class MITMAttacker:
                         "type": "terminate",
                         "reason": reason
                     })
-                    self._shutdown(f"Server terminated: {reason}")
 
                 else:
                     # forward ACK, peer_offline, ...
